@@ -104,6 +104,16 @@ struct gdb_connection {
 	enum gdb_output_flag output_flag;
 	/* Unique index for this GDB connection. */
 	unsigned int unique_index;
+	/* Thread-id of the single step gdb requested ('vCont;s:<tid>' or 's'
+	 * packet) whose stop reply is still pending.  All-stop gdb sets
+	 * trap_expected only on the thread it asks to step, so the reply has
+	 * to name exactly that thread; a reply naming any other thread trips
+	 * the internal error
+	 *   gdb/infrun.c: finish_step_over: Assertion
+	 *   'ecs->event_thread->control.trap_expected' failed.
+	 * While set, gdb_signal_reply() pins the stop reply to this thread.
+	 * Consumed when the reply is sent, cleared if the step is refused. */
+	int64_t stepping_threadid;
 };
 
 #if 0
@@ -820,21 +830,45 @@ static void gdb_signal_reply(struct target *target, struct connection *connectio
 	char current_thread[25];
 	int sig_reply_len;
 	int signal_var;
+	int64_t reply_threadid = 0;	/* thread reported in the reply */
 
 	rtos_update_threads(target);
 
 	if (target->debug_reason == DBG_REASON_EXIT) {
 		sig_reply_len = snprintf(sig_reply, sizeof(sig_reply), "W00");
 	} else {
-		struct target *ct;
+		struct target *ct = target;
 		struct rtos *rtos;
 
 		rtos = rtos_from_target(target);
 		if (rtos) {
-			rtos->current_threadid = rtos->current_thread;
-			rtos->gdb_target_for_threadid(connection, rtos->current_threadid, &ct);
-		} else {
-			ct = target;
+			reply_threadid = rtos->current_thread;
+			if (gdb_connection->stepping_threadid > 0) {
+				/* A single step requested by gdb is completing.
+				 * All-stop gdb requires the stop reply for a
+				 * 'vCont;s:<tid>' (or 's') action to name exactly
+				 * the thread it asked to step; a reply naming any
+				 * other thread trips the internal error in
+				 * gdb/infrun.c finish_step_over().
+				 *
+				 * The thread gdb stepped can meanwhile have
+				 * stopped being "current" in the rtos view: in an
+				 * SMP group a sibling core's stale debug_reason
+				 * can win the current-thread selection, and on
+				 * the stepping core itself an interrupt served
+				 * during the step window can make an rtos
+				 * scheduler switch to another task.  Pin the
+				 * reply to the stepped thread instead of the
+				 * rtos pick. */
+				if (rtos->current_thread != gdb_connection->stepping_threadid)
+					LOG_DEBUG("current thread %" PRIx64 " differs from stepped"
+							" thread %" PRIx64 ", pinning stop reply to the latter",
+							rtos->current_thread,
+							gdb_connection->stepping_threadid);
+				reply_threadid = gdb_connection->stepping_threadid;
+			}
+			rtos->current_threadid = reply_threadid;
+			rtos->gdb_target_for_threadid(connection, reply_threadid, &ct);
 		}
 
 		if (gdb_connection->ctrl_c) {
@@ -872,7 +906,7 @@ static void gdb_signal_reply(struct target *target, struct connection *connectio
 		current_thread[0] = '\0';
 		if (rtos)
 			snprintf(current_thread, sizeof(current_thread), "thread:%" PRIx64 ";",
-					rtos->current_thread);
+					reply_threadid);
 
 		sig_reply_len = snprintf(sig_reply, sizeof(sig_reply), "T%2.2x%s%s",
 				signal_var, stop_reason, current_thread);
@@ -882,6 +916,9 @@ static void gdb_signal_reply(struct target *target, struct connection *connectio
 
 	gdb_put_packet(connection, sig_reply, sig_reply_len);
 	gdb_connection->frontend_state = TARGET_HALTED;
+	/* The stop reply gdb waited for is out; a pending step cannot be in
+	 * flight any more. */
+	gdb_connection->stepping_threadid = 0;
 }
 
 static void gdb_fileio_reply(struct target *target, struct connection *connection)
@@ -990,10 +1027,14 @@ static void gdb_frontend_halted(struct target *target, struct connection *connec
 		gdb_connection->output_flag = GDB_OUTPUT_NO;
 
 		/* check fileio first */
-		if (target_get_gdb_fileio_info(target, target->fileio_info) == ERROR_OK)
+		if (target_get_gdb_fileio_info(target, target->fileio_info) == ERROR_OK) {
 			gdb_fileio_reply(target, connection);
-		else
+			/* A reply went out, so no single-step reply is pending
+			 * any more. */
+			gdb_connection->stepping_threadid = 0;
+		} else {
 			gdb_signal_reply(target, connection);
+		}
 	}
 }
 
@@ -1050,6 +1091,7 @@ static int gdb_new_connection(struct connection *connection)
 	gdb_connection->thread_list = NULL;
 	gdb_connection->output_flag = GDB_OUTPUT_NO;
 	gdb_connection->unique_index = next_unique_id++;
+	gdb_connection->stepping_threadid = 0;
 
 	/* output goes through gdb connection */
 	command_set_output_handler(connection->cmd_ctx, gdb_output, connection);
@@ -3460,6 +3502,11 @@ static bool gdb_handle_vcont_packet(struct connection *connection, const char *p
 			return true;
 		}
 
+		/* Remember the thread being stepped so the stop reply is pinned to
+		 * it even if a sibling core's stale debug_reason would otherwise
+		 * win the current-thread selection in gdb_signal_reply(). */
+		gdb_connection->stepping_threadid = thread_id;
+
 		retval = target_step(ct, current_pc, 0, false);
 		if (retval == ERROR_TARGET_NOT_HALTED)
 			LOG_TARGET_INFO(ct, "target was not halted when step was requested");
@@ -3473,8 +3520,11 @@ static bool gdb_handle_vcont_packet(struct connection *connection, const char *p
 			gdb_signal_reply(ct, connection);
 			/* stop forwarding log packets! */
 			gdb_connection->output_flag = GDB_OUTPUT_NO;
-		} else
+		} else {
 			gdb_connection->frontend_state = TARGET_RUNNING;
+			/* The step was not executed, so no pinned reply is pending. */
+			gdb_connection->stepping_threadid = 0;
+		}
 		return true;
 	}
 	LOG_ERROR("Unknown vCont packet");
@@ -3973,6 +4023,19 @@ static int gdb_input_inner(struct connection *connection)
 						target_call_event_callbacks(target, TARGET_EVENT_GDB_START);
 
 						if (!already_running) {
+							if (packet[0] == 's') {
+								/* Pin the pending step's stop reply to
+								 * the thread gdb selected ('Hg').
+								 * cortex_m steps synchronously, so the
+								 * reply is normally sent from within
+								 * the step below and consumes the pin;
+								 * on targets with an asynchronous step
+								 * the pin persists until the halt event
+								 * delivers the reply. */
+								struct rtos *rtos = rtos_from_target(target);
+								if (rtos && rtos->current_threadid > 0)
+									gdb_con->stepping_threadid = rtos->current_threadid;
+							}
 							/* Here we don't want packet processing to stop even if this fails,
 							 * so we use a local variable instead of retval. */
 							retval = gdb_step_continue_packet(connection, packet, packet_size);
