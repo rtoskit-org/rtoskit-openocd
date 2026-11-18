@@ -79,6 +79,15 @@ static void os_free(struct target *target)
 	if (!target->rtos)
 		return;
 
+	if (target->rtos->target != target) {
+		/* The rtos instance is shared across the SMP group (see the
+		 * rtos smp_init callbacks) and owned by another member; the
+		 * owner's teardown frees it.  Drop only this member's
+		 * reference, freeing here would double-free the instance. */
+		target->rtos = NULL;
+		return;
+	}
+
 	free(target->rtos->symbols);
 	rtos_free_threadlist(target->rtos);
 	free(target->rtos);
