@@ -1557,9 +1557,15 @@ static int cortex_m_step(struct target *target, bool current,
 	 * a normal step, otherwise we have to manually step over the bkpt
 	 * instruction - as such simulate a step */
 	if (!bkpt_inst_found) {
-		if (cortex_m->isrmasking_mode != CORTEX_M_ISRMASK_AUTO) {
-			/* Automatic ISR masking mode off: Just step over the next
-			 * instruction, with interrupts on or off as appropriate. */
+		if (cortex_m->isrmasking_mode != CORTEX_M_ISRMASK_AUTO || target->smp) {
+			/* Automatic ISR masking mode off, or an SMP target: just
+			 * step over the next instruction, with interrupts on or
+			 * off as appropriate.  On an SMP group the AUTO
+			 * interrupt-serving window must not be used: it free-runs
+			 * the core through code that can require the sibling
+			 * cores, which are halted in all-stop mode, deadlocking
+			 * on a cross-core rendezvous until the window times out
+			 * and the core is left running. */
 			cortex_m_set_maskints_for_step(target);
 			cortex_m_write_debug_halt_mask(target, C_STEP, C_HALT);
 		} else {
