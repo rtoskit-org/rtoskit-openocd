@@ -87,6 +87,11 @@ struct rtos_type {
 	 * target running a multi-threading OS. If an RTOS can do this, override
 	 * needs_fake_step(). */
 	bool (*needs_fake_step)(struct target *target, int64_t thread_id);
+	/* Return the thread-id of the thread the rtos runs on the given
+	 * target (core) of the SMP group, or a negative value when the
+	 * driver cannot tell.  Optional; used by the gdb server to attribute
+	 * a stop to the thread of the core that raised the debug event. */
+	int64_t (*threadid_for_target)(struct rtos *rtos, struct target *target);
 	/* When a software breakpoint is set, it is set on only one target,
 	 * because we assume memory is shared across them. By default this is the
 	 * first target in the SMP group. Override this function to have

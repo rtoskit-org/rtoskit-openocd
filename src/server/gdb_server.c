@@ -872,6 +872,24 @@ static void gdb_signal_reply(struct target *target, struct connection *connectio
 							rtos->current_thread,
 							gdb_connection->stepping_threadid);
 				reply_threadid = gdb_connection->stepping_threadid;
+			} else if (rtos->type->threadid_for_target) {
+				/* No step pending: attribute the stop to the thread
+				 * the rtos runs on the core that raised this event,
+				 * not to the rtos-wide current-thread pick.  On an
+				 * SMP group the pick regularly names a task of the
+				 * sibling core (halted by the group halt), which
+				 * gdb then reports as a spurious SIGTRAP for a
+				 * thread that hit nothing. */
+				int64_t event_threadid =
+					rtos->type->threadid_for_target(rtos, target);
+				if (event_threadid > 0 && event_threadid != reply_threadid) {
+					LOG_DEBUG("rtos current thread %" PRIx64 " differs from"
+							" the thread running on event target %s (%" PRIx64
+							"), reporting the latter",
+							rtos->current_thread, target_name(target),
+							event_threadid);
+					reply_threadid = event_threadid;
+				}
 			}
 			rtos->current_threadid = reply_threadid;
 			rtos->gdb_target_for_threadid(connection, reply_threadid, &ct);
@@ -1054,9 +1072,43 @@ static int gdb_target_callback_event_handler(struct target *target,
 		return ERROR_OK;
 
 	switch (event) {
-		case TARGET_EVENT_GDB_HALT:
-			gdb_frontend_halted(target, connection);
+		case TARGET_EVENT_GDB_HALT: {
+			/* The halted event arrives per core of the SMP group,
+			 * while gdb_service->target may still name a sibling (it
+			 * is last set by a single step, see cortex_m_step()).
+			 * Forward the halt of the core carrying the significant
+			 * debug reason, so the stop reply is attributed to the
+			 * core - and thus the thread - that raised the event.
+			 * Sibling events are harmless afterwards: gdb_frontend_
+			 * halted() only reacts while frontend_state is
+			 * TARGET_RUNNING, and the first reply clears that. */
+			struct target *halted_target = target;
+			if (target->smp && target->smp_targets) {
+				struct target_list *tlist;
+				foreach_smp_target(tlist, target->smp_targets) {
+					struct target *t = tlist->target;
+					if (t->state != TARGET_HALTED)
+						continue;
+					switch (t->debug_reason) {
+						case DBG_REASON_BREAKPOINT:
+						case DBG_REASON_WATCHPOINT:
+						case DBG_REASON_WPTANDBKPT:
+						case DBG_REASON_SINGLESTEP:
+						case DBG_REASON_EXC_CATCH:
+							halted_target = t;
+							break;
+						default:
+							break;
+					}
+				}
+			}
+			if (gdb_target != halted_target) {
+				struct gdb_service *gdb_service = connection->service->priv;
+				gdb_service->target = halted_target;
+			}
+			gdb_frontend_halted(halted_target, connection);
 			break;
+		}
 		case TARGET_EVENT_HALTED:
 			target_call_event_callbacks(target, TARGET_EVENT_GDB_END);
 			break;

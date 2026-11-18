@@ -29,6 +29,7 @@ static int hwthread_read_buffer(struct rtos *rtos, target_addr_t address,
 static int hwthread_write_buffer(struct rtos *rtos, target_addr_t address,
 		uint32_t size, const uint8_t *buffer);
 static bool hwthread_needs_fake_step(struct target *target, int64_t thread_id);
+static int64_t hwthread_threadid_for_target(struct rtos *rtos, struct target *target);
 struct target *hwthread_swbp_target(struct rtos *rtos, target_addr_t address,
 				    uint32_t length, enum breakpoint_type type);
 
@@ -64,6 +65,7 @@ const struct rtos_type hwthread_rtos = {
 	.write_buffer = hwthread_write_buffer,
 	.needs_fake_step = hwthread_needs_fake_step,
 	.swbp_target = hwthread_swbp_target,
+	.threadid_for_target = hwthread_threadid_for_target,
 };
 
 struct hwthread_params {
@@ -465,4 +467,12 @@ struct target *hwthread_swbp_target(struct rtos *rtos, target_addr_t address,
 				    uint32_t length, enum breakpoint_type type)
 {
 	return hwthread_find_thread(rtos->target, rtos->current_thread);
+}
+
+static int64_t hwthread_threadid_for_target(struct rtos *rtos, struct target *target)
+{
+	if (!rtos || !target || !target->smp)
+		return -1;
+
+	return threadid_from_target(target);
 }

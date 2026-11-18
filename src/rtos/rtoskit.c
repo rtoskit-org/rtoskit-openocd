@@ -215,6 +215,7 @@ static const struct rtoskit_symbol_def rtoskit_symbol_defs[RTOSKIT_SYM_COUNT] = 
 struct rtoskit_params {
 	int num_cores;              /* derived from presence of __core_local_1 */
 	bool has_fpu;               /* derived from target->armv7m->fp_feature */
+	uint32_t running_tcb[2];    /* per-core current_task, cached by update_threads */
 };
 
 /* ------------------------------------------------------------------------- */
@@ -230,8 +231,28 @@ static int  rtoskit_get_thread_reg_list(struct rtos *rtos, int64_t thread_id,
 static int  rtoskit_get_symbol_list_to_lookup(struct symbol_table_elem *symbol_list[]);
 static int  rtoskit_gdb_target_for_threadid(struct connection *connection,
 		int64_t thread_id, struct target **p_target);
+static int64_t rtoskit_threadid_for_target(struct rtos *rtos, struct target *target);
 static int  rtoskit_unwind_saved_frame(struct rtos *rtos, uint32_t tcb_ptr,
 		uint32_t state, struct rtos_reg **reg_list, int *num_regs);
+
+static int64_t rtoskit_threadid_for_target(struct rtos *rtos, struct target *target)
+{
+	struct rtoskit_params *p = rtos ? rtos->rtos_specific_params : NULL;
+
+	if (!p || !target)
+		return -1;
+
+	int core = target->coreid;
+	if (core < 0 || core >= p->num_cores || core > 1)
+		return -1;
+
+	if (p->running_tcb[core])
+		return (int64_t)p->running_tcb[core];
+
+	/* No live task on this core (e.g. pre-scheduler boot): fall back
+	 * to the synthetic per-core idle thread id. */
+	return core + 1;
+}
 
 const struct rtos_type rtoskit_rtos = {
 	.name                      = "rtoskit",
@@ -241,6 +262,7 @@ const struct rtos_type rtoskit_rtos = {
 	.update_threads            = rtoskit_update_threads,
 	.get_thread_reg_list       = rtoskit_get_thread_reg_list,
 	.get_symbol_list_to_lookup = rtoskit_get_symbol_list_to_lookup,
+	.threadid_for_target       = rtoskit_threadid_for_target,
 };
 
 /* ------------------------------------------------------------------------- */
@@ -535,6 +557,15 @@ static int rtoskit_update_threads(struct rtos *rtos)
 		(void)target_read_u32(rtos->target, cls_addr, &cur_tcb[c]);
 		LOG_DEBUG("rtoskit: update_threads: core%d: current_task@0x%08" PRIx32
 				" = 0x%08" PRIx32, c, cls_addr, cur_tcb[c]);
+	}
+
+	/* Cache the per-core running tasks for threadid_for_target(). */
+	{
+		struct rtoskit_params *pp = rtos->rtos_specific_params;
+		if (pp) {
+			pp->running_tcb[0] = cur_tcb[0];
+			pp->running_tcb[1] = cur_tcb[1];
+		}
 	}
 
 	/* Walk scheduler->tasks via the embedded sched_list head.
