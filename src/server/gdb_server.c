@@ -192,7 +192,13 @@ static int gdb_last_signal(struct target *target)
 
 	switch (target->debug_reason) {
 		case DBG_REASON_DBGRQ:
-			return 0x2;		/* SIGINT */
+			/* A halt requested through DHCSR C_HALT: the halt command,
+			 * an SMP group halt of a sibling core, or a reset halt.
+			 * This is not a real interrupt, so report SIGTRAP like
+			 * most stubs do for stub-initiated halts.  A genuine gdb
+			 * Ctrl-C still reports SIGINT through the ctrl_c flag
+			 * handled in gdb_signal_reply(). */
+			return 0x05;	/* SIGTRAP */
 		case DBG_REASON_BREAKPOINT:
 		case DBG_REASON_WATCHPOINT:
 		case DBG_REASON_WPTANDBKPT:
@@ -204,7 +210,7 @@ static int gdb_last_signal(struct target *target)
 		case DBG_REASON_NOTHALTED:
 			return 0x0;		/* no signal... shouldn't happen */
 		default:
-			LOG_USER("undefined debug reason %d (%s) - target needs reset",
+			LOG_DEBUG("undefined debug reason %d (%s)",
 					target->debug_reason,
 					target_debug_reason_str(target->debug_reason));
 			return 0x0;
