@@ -39,6 +39,7 @@
 #include "target/register.h"
 #include "target/smp.h"
 #include "server/gdb_server.h"
+#include "helper/binarybuffer.h"
 #include "helper/log.h"
 #include "helper/types.h"
 
@@ -84,8 +85,10 @@
  * tables below.
  */
 #define RTOSKIT_FRAME_EXEC_RETURN     0x00 /* both layouts */
+#define RTOSKIT_FRAME_CONTROL         0x04 /* both layouts; task CONTROL at switch */
+#define RTOSKIT_FRAME_BASEPRI         0x08 /* both layouts; task BASEPRI at switch */
 #define RTOSKIT_FRAME_R4              0x0c /* both layouts */
-#define RTOSKIT_FRAME_PSPLIM          0x2c /* ARMv8-M only; not exposed to GDB */
+#define RTOSKIT_FRAME_PSPLIM          0x2c /* ARMv8-M only */
 
 #define RTOSKIT_FRAME_NOFP_R0         0x30
 #define RTOSKIT_FRAME_NOFP_R12        0x40
@@ -167,20 +170,23 @@ static const struct stack_register_offset rtoskit_fp_offsets[ARMV7M_NUM_CORE_REG
 	{ ARMV7M_XPSR, RTOSKIT_FRAME_FP_XPSR,        32 },
 };
 
+/* r13 of a switched-out task is the scheduler_frame base (the psp saved in
+ * the TCB).  The hardware exception-entry alignment emulation does not apply:
+ * the frame is pushed by the context switch itself, and an "adjusted" sp
+ * would differ from psp, tripping gdb's "unable to determine sp alias"
+ * heuristic for M-profile targets. */
 static target_addr_t rtoskit_nofp_calc_sp(struct target *t,
 		const uint8_t *stack_data, const struct rtos_register_stacking *stacking,
 		target_addr_t stack_ptr)
 {
-	return rtos_cortex_m_stack_align(t, stack_data, stacking, stack_ptr,
-			RTOSKIT_FRAME_NOFP_XPSR);
+	return stack_ptr;
 }
 
 static target_addr_t rtoskit_fp_calc_sp(struct target *t,
 		const uint8_t *stack_data, const struct rtos_register_stacking *stacking,
 		target_addr_t stack_ptr)
 {
-	return rtos_cortex_m_stack_align(t, stack_data, stacking, stack_ptr,
-			RTOSKIT_FRAME_FP_XPSR);
+	return stack_ptr;
 }
 
 static const struct rtos_register_stacking rtoskit_stacking_nofp = {
@@ -232,6 +238,8 @@ static int  rtoskit_get_symbol_list_to_lookup(struct symbol_table_elem *symbol_l
 static int  rtoskit_gdb_target_for_threadid(struct connection *connection,
 		int64_t thread_id, struct target **p_target);
 static int64_t rtoskit_threadid_for_target(struct rtos *rtos, struct target *target);
+static int  rtoskit_get_thread_reg_value(struct rtos *rtos, int64_t thread_id,
+		uint32_t reg_num, uint32_t *size, uint8_t **value);
 static int  rtoskit_unwind_saved_frame(struct rtos *rtos, uint32_t tcb_ptr,
 		uint32_t state, struct rtos_reg **reg_list, int *num_regs);
 
@@ -254,6 +262,124 @@ static int64_t rtoskit_threadid_for_target(struct rtos *rtos, struct target *tar
 	return core + 1;
 }
 
+/* Per-register access for gdb 'p' packets.  The frame-saved special
+ * registers are served from the task's own scheduler_frame; serving them
+ * from the live register cache of the routed core (the default stitch when
+ * only get_thread_reg_list exists) hands gdb values that belong to whichever
+ * task happens to run there - psp then differs from the stacked r13 and
+ * gdb warns "Invalid state, unable to determine sp alias, assuming msp".
+ * Core registers come from the saved-frame list; everything else (MSP,
+ * PRIMASK, ...) from the live cache of the routed target. */
+static int rtoskit_get_thread_reg_value(struct rtos *rtos, int64_t thread_id,
+		uint32_t reg_num, uint32_t *size, uint8_t **value)
+{
+	struct rtoskit_params *p = rtos ? rtos->rtos_specific_params : NULL;
+	struct target *head = rtos ? rtos->target : NULL;
+
+	if (!p || !head)
+		return ERROR_FAIL;
+
+	/* Route like gdb_target_for_threadid(): RUNNING task -> its core,
+	 * anything else -> the SMP head. */
+	struct target *routed = head;
+	if (thread_id > 0 && thread_id <= p->num_cores) {
+		struct target_list *tl;
+		if (head->smp_targets)
+			foreach_smp_target(tl, head->smp_targets)
+				if (tl->target->coreid == (int)(thread_id - 1))
+					routed = tl->target;
+	} else if (thread_id > 0) {
+		uint32_t tcb_ptr = (uint32_t)thread_id;
+		uint32_t tmarker = 0, state = 0, tcore = 0, psp = 0;
+		bool tcb_ok = target_read_u32(head, tcb_ptr + RTOSKIT_TCB_MARKER,
+				&tmarker) == ERROR_OK && tmarker == RTOSKIT_TASK_MARKER_VALUE;
+		if (tcb_ok) {
+			(void)target_read_u32(head, tcb_ptr + RTOSKIT_TCB_STATE, &state);
+			(void)target_read_u32(head, tcb_ptr + RTOSKIT_TCB_CORE, &tcore);
+			(void)target_read_u32(head, tcb_ptr + RTOSKIT_TCB_PSP, &psp);
+		}
+
+		if (tcb_ok && state != RTOSKIT_TASK_RUNNING && psp != 0) {
+			/* Saved frame specials. */
+			uint32_t val = psp;
+			bool from_frame = true;
+			switch (reg_num) {
+				case ARMV7M_PSP:
+				case ARMV8M_PSP_S:
+				case ARMV8M_PSP_NS:
+					/* equals the r13 computed by the stacking */
+					break;
+				case ARMV7M_CONTROL:
+					(void)target_read_u32(head, psp + RTOSKIT_FRAME_CONTROL, &val);
+					break;
+				case ARMV7M_BASEPRI:
+					(void)target_read_u32(head, psp + RTOSKIT_FRAME_BASEPRI, &val);
+					break;
+				case ARMV8M_PSPLIM:
+				case ARMV8M_PSPLIM_S:
+				case ARMV8M_PSPLIM_NS:
+					(void)target_read_u32(head, psp + RTOSKIT_FRAME_PSPLIM, &val);
+					break;
+				default:
+					from_frame = false;
+					break;
+			}
+			if (from_frame) {
+				*value = malloc(4);
+				if (!*value)
+					return ERROR_FAIL;
+				buf_set_u32(*value, 0, 32, val);
+				*size = 32;
+				return ERROR_OK;
+			}
+		}
+
+		if (tcb_ok && state == RTOSKIT_TASK_RUNNING) {
+			struct target_list *tl;
+			if (head->smp_targets)
+				foreach_smp_target(tl, head->smp_targets)
+					if (tl->target->coreid == (int)tcore)
+						routed = tl->target;
+		}
+	}
+
+	/* Core registers: the thread's register list (saved frame, or live
+	 * cache through get_thread_reg_list's own routing). */
+	struct rtos_reg *reg_list = NULL;
+	int num_regs = 0;
+	if (rtoskit_get_thread_reg_list(rtos, thread_id, &reg_list, &num_regs) == ERROR_OK) {
+		for (int i = 0; i < num_regs; ++i) {
+			if (reg_list[i].number == reg_num) {
+				unsigned int bytes = DIV_ROUND_UP(reg_list[i].size, 8);
+				*value = malloc(bytes);
+				if (!*value) {
+					free(reg_list);
+					return ERROR_FAIL;
+				}
+				memcpy(*value, reg_list[i].value, bytes);
+				*size = reg_list[i].size;
+				free(reg_list);
+				return ERROR_OK;
+			}
+		}
+		free(reg_list);
+	}
+
+	/* Anything else: the live register cache of the routed target. */
+	struct reg *reg = register_get_by_number(routed->reg_cache, reg_num, true);
+	if (!reg || !reg->exist)
+		return ERROR_FAIL;
+	if (reg->type->get(reg) != ERROR_OK)
+		return ERROR_FAIL;
+	unsigned int bytes = DIV_ROUND_UP(reg->size, 8);
+	*value = malloc(bytes);
+	if (!*value)
+		return ERROR_FAIL;
+	memcpy(*value, reg->value, bytes);
+	*size = reg->size;
+	return ERROR_OK;
+}
+
 const struct rtos_type rtoskit_rtos = {
 	.name                      = "rtoskit",
 	.detect_rtos               = rtoskit_detect_rtos,
@@ -263,6 +389,7 @@ const struct rtos_type rtoskit_rtos = {
 	.get_thread_reg_list       = rtoskit_get_thread_reg_list,
 	.get_symbol_list_to_lookup = rtoskit_get_symbol_list_to_lookup,
 	.threadid_for_target       = rtoskit_threadid_for_target,
+	.get_thread_reg_value      = rtoskit_get_thread_reg_value,
 };
 
 /* ------------------------------------------------------------------------- */
