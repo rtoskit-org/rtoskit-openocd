@@ -626,7 +626,8 @@ static int rtoskit_create(struct target *target)
 		return ERROR_FAIL;
 	}
 
-	p->num_cores = 0;   /* re-derived from __core_local_1 in update_threads */
+	p->num_cores = 1;   /* single core; re-derived from the SMP group in smp_init
+			     * and from __core_local_1 in update_threads */
 	p->has_fpu = false; /* re-derived in update_threads after target examination */
 
 	target->rtos->rtos_specific_params = p;
@@ -686,6 +687,20 @@ static int rtoskit_smp_init(struct target *target)
 		}
 		m->rtos = target->rtos;
 		LOG_DEBUG("rtoskit: smp_init: bound %s to head rtos", target_name(m));
+	}
+
+	/* Derive the core count from the group here, at configuration time:
+	 * the synthetic per-core thread ids (1..num_cores) must route
+	 * before the first update_threads() has run - e.g. register reads
+	 * for the pre-init placeholder thread id 1, which otherwise falls
+	 * through to the TCB path and marker-checks a bogus pointer. */
+	if (target->rtos && target->rtos->rtos_specific_params) {
+		struct rtoskit_params *pp = target->rtos->rtos_specific_params;
+		int cores = 0;
+		foreach_smp_target(tl, target->smp_targets)
+			++cores;
+		pp->num_cores = cores;
+		LOG_DEBUG("rtoskit: smp_init: num_cores=%d", cores);
 	}
 	return ERROR_OK;
 }
