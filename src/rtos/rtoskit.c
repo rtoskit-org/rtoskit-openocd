@@ -623,8 +623,21 @@ static int rtoskit_update_threads(struct rtos *rtos)
 	if (!rtos)
 		return ERROR_FAIL;
 	if (!rtos->symbols) {
-		LOG_ERROR("rtoskit: update_threads: no symbols");
-		return ERROR_FAIL;
+		/* Normal until the first gdb connection has run the qSymbol
+		 * exchange; update_threads() is also reached from target
+		 * init (smp_init), before any debugger is attached. */
+		LOG_DEBUG("rtoskit: update_threads: no symbols resolved yet");
+		rtos_free_threadlist(rtos);
+		rtos->thread_details = calloc(1, sizeof(struct thread_detail));
+		if (!rtos->thread_details)
+			return ERROR_FAIL;
+		rtos->thread_details[0].threadid = 1;
+		rtos->thread_details[0].exists = true;
+		rtos->thread_details[0].thread_name_str = strdup("rtoskit:no-symbols");
+		rtos->thread_details[0].extra_info_str = strdup("qSymbol exchange not yet run");
+		rtos->thread_count = 1;
+		rtos->current_thread = 1;
+		return ERROR_OK;
 	}
 
 	rtos_free_threadlist(rtos);
@@ -700,6 +713,7 @@ static int rtoskit_update_threads(struct rtos *rtos)
 		LOG_DEBUG("rtoskit: update_threads: scheduler marker 0x%08" PRIx32
 				" != 0x%08" PRIx32 " - scheduler not initialised",
 				marker, (uint32_t)RTOSKIT_SCHED_MARKER_VALUE);
+		rtos_free_threadlist(rtos);
 		rtos->thread_details = calloc(1, sizeof(struct thread_detail));
 		if (!rtos->thread_details)
 			return ERROR_FAIL;
