@@ -240,6 +240,7 @@ static int  rtoskit_gdb_target_for_threadid(struct connection *connection,
 static int64_t rtoskit_threadid_for_target(struct rtos *rtos, struct target *target);
 static int  rtoskit_get_thread_reg_value(struct rtos *rtos, int64_t thread_id,
 		uint32_t reg_num, uint32_t *size, uint8_t **value);
+static bool rtoskit_needs_fake_step(struct target *target, int64_t thread_id);
 static int  rtoskit_unwind_saved_frame(struct rtos *rtos, uint32_t tcb_ptr,
 		uint32_t state, struct rtos_reg **reg_list, int *num_regs);
 
@@ -260,6 +261,37 @@ static int64_t rtoskit_threadid_for_target(struct rtos *rtos, struct target *tar
 	/* No live task on this core (e.g. pre-scheduler boot): fall back
 	 * to the synthetic per-core idle thread id. */
 	return core + 1;
+}
+
+/* A step can be executed for every task that is RUNNING on some core:
+ * gdb_target_for_threadid() routes the step to that core and
+ * cortex_m_step() runs it.  Only a task that is not on any core cannot
+ * be stepped and needs the immediate fake reply (gdb bug 22925).  The
+ * generic default compares against the rtos-wide current_thread pick,
+ * which on an SMP group names the task of one specific core only, and
+ * silently turned every step of the other core's tasks into a no-op. */
+static bool rtoskit_needs_fake_step(struct target *target, int64_t thread_id)
+{
+	struct rtoskit_params *p = target->rtos ?
+		target->rtos->rtos_specific_params : NULL;
+
+	if (!p || thread_id <= 0)
+		return true;	/* "any thread" id: the stop reply cannot be
+				 * pinned to the id gdb stepped, keep the
+				 * immediate fake reply */
+
+	if (thread_id <= p->num_cores)
+		return false;	/* synthetic per-core id: step the core */
+
+	uint32_t tcb_ptr = (uint32_t)thread_id;
+	uint32_t tmarker = 0, state = 0;
+	if (target_read_u32(target, tcb_ptr + RTOSKIT_TCB_MARKER, &tmarker) != ERROR_OK ||
+			tmarker != RTOSKIT_TASK_MARKER_VALUE)
+		return false;	/* not a valid tcb: let the step path deal with it */
+
+	(void)target_read_u32(target, tcb_ptr + RTOSKIT_TCB_STATE, &state);
+
+	return state != RTOSKIT_TASK_RUNNING;
 }
 
 /* Per-register access for gdb 'p' packets.  The frame-saved special
@@ -390,6 +422,7 @@ const struct rtos_type rtoskit_rtos = {
 	.get_symbol_list_to_lookup = rtoskit_get_symbol_list_to_lookup,
 	.threadid_for_target       = rtoskit_threadid_for_target,
 	.get_thread_reg_value      = rtoskit_get_thread_reg_value,
+	.needs_fake_step           = rtoskit_needs_fake_step,
 };
 
 /* ------------------------------------------------------------------------- */
