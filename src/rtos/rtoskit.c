@@ -58,6 +58,23 @@
 #define RTOSKIT_TCB_SCHEDULER_NODE   0x2c
 #define RTOSKIT_TCB_MARKER           0x54
 
+/* CMSIS-RTOSv2 rtos2_kernel / rtos_thread layout, verified against the
+ * firmware ELF.  When the application links the CMSIS layer, the global
+ * rtos2_kernel points at a struct rtos_kernel whose marker validates and
+ * whose resources[osResourceThread] list links every struct rtos_thread;
+ * rtos_thread.stack points at the scheduler task and rtos_thread.name
+ * holds the thread name.  All offsets fail safe: a wrong marker or a
+ * failed read falls back to the synthetic task@addr names. */
+#define RTOSKIT_R2_THREAD_MARKER       0x42011024UL
+#define RTOSKIT_R2_KERNEL_RESOURCES    128    /* offsetof(rtos_kernel, resources) */
+#define RTOSKIT_R2_RESOURCE_SIZE       64     /* sizeof(rtos_resource) */
+#define RTOSKIT_R2_RESOURCE_LIST       40     /* offsetof(rtos_resource, resource_list) */
+#define RTOSKIT_R2_THREAD_NAME         4      /* offsetof(rtos_thread, name) */
+#define RTOSKIT_R2_THREAD_NAME_SIZE    32     /* RTOS_NAME_SIZE */
+#define RTOSKIT_R2_THREAD_STACK        48     /* offsetof(rtos_thread, stack) */
+#define RTOSKIT_R2_THREAD_NODE         216    /* offsetof(rtos_thread, resource_node) */
+#define RTOSKIT_R2_MAX_THREADS         96
+
 /* struct scheduler — fields accessed by this driver.  locked and critical
  * carry __aligned(16) in the kernel; the offsets below already account for
  * the padding.
@@ -118,6 +135,7 @@ enum rtoskit_symbol {
 	RTOSKIT_SYM_CORE_LOCAL_0,
 	RTOSKIT_SYM_CORE_LOCAL_1,
 	RTOSKIT_SYM_CORE_DATA_SIZE,
+	RTOSKIT_SYM_RTOS2_KERNEL,
 	RTOSKIT_SYM_COUNT,
 };
 
@@ -212,6 +230,7 @@ static const struct rtoskit_symbol_def rtoskit_symbol_defs[RTOSKIT_SYM_COUNT] = 
 	[RTOSKIT_SYM_CORE_LOCAL_0]    = { "__core_local_0",  false },
 	[RTOSKIT_SYM_CORE_LOCAL_1]    = { "__core_local_1",  true  },
 	[RTOSKIT_SYM_CORE_DATA_SIZE]  = { "__core_data_size", true },
+	[RTOSKIT_SYM_RTOS2_KERNEL]    = { "rtos2_kernel",     true },
 };
 
 /* ------------------------------------------------------------------------- */
@@ -432,6 +451,69 @@ const struct rtos_type rtoskit_rtos = {
 static symbol_address_t rtoskit_sym(const struct rtos *rtos, enum rtoskit_symbol s)
 {
 	return rtos->symbols ? rtos->symbols[s].address : 0;
+}
+
+struct rtoskit_r2_name {
+	uint32_t stack;
+	char name[RTOSKIT_R2_THREAD_NAME_SIZE];
+};
+
+/* Walk rtos2_kernel->resources[osResourceThread] once and collect the
+ * {scheduler task, name} pairs of every valid struct rtos_thread. */
+static int rtoskit_collect_r2_names(struct rtos *rtos,
+		struct rtoskit_r2_name *names, int max_names)
+{
+	int found = 0;
+
+	symbol_address_t ksym = rtoskit_sym(rtos, RTOSKIT_SYM_RTOS2_KERNEL);
+	if (!ksym)
+		return 0;
+
+	uint32_t kernel = 0;
+	if (target_read_u32(rtos->target, ksym, &kernel) != ERROR_OK || !kernel)
+		return 0;
+
+	/* NOTE: the firmware leaves rtos_kernel.marker unwritten (observed
+	 * zero at runtime), so the kernel is not marker-validated here.  A
+	 * stale or foreign kernel pointer is still harmless: every list
+	 * entry is validated by its own struct rtos_thread marker below,
+	 * and failed reads simply stop the walk. */
+
+	uint32_t head = kernel + RTOSKIT_R2_KERNEL_RESOURCES +
+			0 * RTOSKIT_R2_RESOURCE_SIZE + RTOSKIT_R2_RESOURCE_LIST;
+
+	uint32_t node = 0;
+	if (target_read_u32(rtos->target, head, &node) != ERROR_OK)
+		return 0;
+
+	for (int guard = 0; node && node != head && found < max_names &&
+			guard < RTOSKIT_R2_MAX_THREADS; ++guard) {
+		uint32_t th = node - RTOSKIT_R2_THREAD_NODE;
+
+		uint32_t tmarker = 0, stack = 0;
+		if (target_read_u32(rtos->target, th, &tmarker) != ERROR_OK ||
+				target_read_u32(rtos->target, th + RTOSKIT_R2_THREAD_STACK,
+						&stack) != ERROR_OK)
+			break;
+
+		if (tmarker == RTOSKIT_R2_THREAD_MARKER && stack) {
+			names[found].stack = stack;
+			memset(names[found].name, 0, RTOSKIT_R2_THREAD_NAME_SIZE);
+			(void)target_read_buffer(rtos->target, th + RTOSKIT_R2_THREAD_NAME,
+					RTOSKIT_R2_THREAD_NAME_SIZE,
+					(uint8_t *)names[found].name);
+			names[found].name[RTOSKIT_R2_THREAD_NAME_SIZE - 1] = '\0';
+			++found;
+		}
+
+		if (target_read_u32(rtos->target, node, &node) != ERROR_OK)
+			break;
+	}
+
+	if (found)
+		LOG_DEBUG("rtoskit: names: %d CMSIS-RTOSv2 threads", found);
+
+	return found;
 }
 
 static int rtoskit_get_symbol_list_to_lookup(struct symbol_table_elem *symbol_list[])
@@ -796,6 +878,10 @@ static int rtoskit_update_threads(struct rtos *rtos)
 		LOG_ERROR("rtoskit: update_threads: hit RTOSKIT_MAX_TASKS=%d cap — list may be corrupt",
 				RTOSKIT_MAX_TASKS);
 
+	/* CMSIS-RTOSv2 thread names, when the application links the layer. */
+	struct rtoskit_r2_name r2_names[RTOSKIT_R2_MAX_THREADS];
+	int r2_count = rtoskit_collect_r2_names(rtos, r2_names, RTOSKIT_R2_MAX_THREADS);
+
 	LOG_DEBUG("rtoskit: update_threads: walked %d tasks (head@0x%08" PRIx32
 			" cur=[0x%08" PRIx32 ", 0x%08" PRIx32 "])",
 			n_tcbs, tasks_head, cur_tcb[0], cur_tcb[1]);
@@ -857,7 +943,15 @@ static int rtoskit_update_threads(struct rtos *rtos)
 
 		rtos->thread_details[i].threadid = (threadid_t)tcb_ptr;
 		rtos->thread_details[i].exists = true;
+		const char *r2_name = NULL;
+		for (int n = 0; n < r2_count; ++n) {
+			if (r2_names[n].stack == tcb_ptr) {
+				r2_name = r2_names[n].name;
+				break;
+			}
+		}
 		rtos->thread_details[i].thread_name_str =
+				(r2_name && r2_name[0]) ? strdup(r2_name) :
 				alloc_printf("task@0x%08" PRIx32, tcb_ptr);
 		if (bad_marker)
 			rtos->thread_details[i].extra_info_str = alloc_printf(
