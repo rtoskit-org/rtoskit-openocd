@@ -691,6 +691,27 @@ static int rtoskit_update_threads(struct rtos *rtos)
 	uint32_t running = 0;
 	(void)target_read_u32(rtos->target, sched_ptr + RTOSKIT_SCHED_RUNNING, &running);
 
+	/* The marker is written by scheduler_init().  Anything else means the
+	 * scheduler structure is stale or not yet initialised - e.g. a gdb
+	 * connect before the firmware got that far, with RAM still holding
+	 * fragments of the previous boot.  Walking the task list in that
+	 * state chases garbage node pointers and spews read errors. */
+	if (marker != RTOSKIT_SCHED_MARKER_VALUE) {
+		LOG_DEBUG("rtoskit: update_threads: scheduler marker 0x%08" PRIx32
+				" != 0x%08" PRIx32 " - scheduler not initialised",
+				marker, (uint32_t)RTOSKIT_SCHED_MARKER_VALUE);
+		rtos->thread_details = calloc(1, sizeof(struct thread_detail));
+		if (!rtos->thread_details)
+			return ERROR_FAIL;
+		rtos->thread_details[0].threadid = 1;
+		rtos->thread_details[0].exists = true;
+		rtos->thread_details[0].thread_name_str = strdup("rtoskit:not-started");
+		rtos->thread_details[0].extra_info_str = strdup("scheduler_init() not yet run");
+		rtos->thread_count = 1;
+		rtos->current_thread = 1;
+		return ERROR_OK;
+	}
+
 	uint32_t tasks_head = sched_ptr + RTOSKIT_SCHED_TASKS;
 	uint32_t cls_offset = (uint32_t)(curtask_sym - cdata);
 	int num_cores = clocal1 ? 2 : 1;
